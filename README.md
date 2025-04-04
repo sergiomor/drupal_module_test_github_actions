@@ -22,6 +22,7 @@ This setup allows you to run PHPUnit tests for your Drupal custom module in a Gi
 * Drush
 * [Docker Desktop](https://www.docker.com/products/docker-desktop/) with WSL2 backend (for Windows users)
 * [act](https://github.com/nektos/act) for local GitHub Actions testing
+* Selenium server for JavaScript tests
 
 ### For GitHub Actions
 
@@ -42,13 +43,6 @@ This setup allows you to run PHPUnit tests for your Drupal custom module in a Gi
    ```
    # Run PowerShell as Administrator
    choco install act-cli
-   ```
-
-3. Run Docker Desktop as Administrator
-
-4. Always run act commands in an Administrator PowerShell:
-   ```
-   act -W .github/workflows/phpunit.yml -j build --container-daemon-socket "npipe:////./pipe/docker_engine"
    ```
 
 ### Linux/macOS Setup
@@ -72,7 +66,24 @@ This setup allows you to run PHPUnit tests for your Drupal custom module in a Gi
    brew install act
    ```
 
-3. Run act:
+## Running Tests with GitHub Actions Locally
+
+To run ALL tests using GitHub Actions workflow locally:
+
+### Windows
+
+1. Start Docker Desktop as Administrator
+
+2. Run this command in PowerShell as Administrator:
+
+```powershell
+act -W .github/workflows/phpunit.yml -j phpunit -P ubuntu:ghcr.io/catthehacker/ubuntu:act-latest --container-daemon-socket "npipe:////./pipe/docker_engine"
+``` 
+
+### Linux/macOS
+
+1. Run act:
+
    ```
    act -W .github/workflows/phpunit.yml
    ```
@@ -96,58 +107,79 @@ name: PHPUnit Tests
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - develop
   pull_request:
-    branches: [ main ]
 
 jobs:
-  build:
+  phpunit:
     runs-on: ubuntu-latest
-    
+
     services:
       mysql:
         image: mysql:5.7
         env:
           MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: MODULE_NAME_testing
+          MYSQL_DATABASE: drupal_testing
         ports:
           - 3306:3306
-        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      selenium:
+        image: selenium/standalone-chrome:latest
+        ports:
+          - 4444:4444
 
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.3'
-          extensions: mbstring, pdo, xml, dom, json
+          php-version: 8.2
+          extensions: gd, pdo_mysql, mbstring
+          coverage: none
 
       - name: Install Composer dependencies
         run: |
-          composer install --no-interaction --no-progress
+          composer install --no-interaction --prefer-dist
+          cp web/sites/default/default.settings.php web/sites/default/settings.php
+          composer require drush/drush --no-interaction
 
       - name: Install Drupal
+        env:
+          SIMPLETEST_DB: "mysql://root:root@127.0.0.1/drupal_testing"
+          SIMPLETEST_BASE_URL: "http://127.0.0.1"
         run: |
-          composer require drush/drush
-          ./vendor/bin/drush site:install standard -y \
-            --db-url="mysql://root:root@mysql:3306/MODULE_NAME_testing" \
-            --site-name="Test site" \
-            --account-name=admin \
-            --account-pass=admin
+          # Use Drupal's test site install script (adjust the path if needed)
+          php web/core/scripts/test-site.php install --db-url="$SIMPLETEST_DB" --base-url="$SIMPLETEST_BASE_URL" --install-profile=standard --langcode=en
 
       - name: Enable required modules
         run: |
-          cd web
-          ../vendor/bin/drush pm:list --type=module | grep MODULE_NAME
-          ../vendor/bin/drush en MODULE_NAME -y -v
-          cd ..
+          chmod +x ./vendor/bin/drush
+          chmod +x ./vendor/drush/drush/drush
+          chmod +x ./vendor/bin/drush.php
           
-          # Prepare testing environment
-          mkdir -p /tmp/browser_output
-          chmod -R 777 /tmp/browser_output web/sites/default/files web/sites/simpletest
+          # Enable module with debug output
+          php ./vendor/drush/drush/drush en draggable_mapper -y
 
-      - name: Run PHPUnit tests
+      - name: Prepare testing environment
+        run: |
+          # Create all parent directories with proper permissions
+          mkdir -p web/sites/simpletest/browser_output
+          
+          # Set world-writable permissions recursively
+          chmod -R 777 web/sites
+
+      - name: Run PHPUnit
+        env:
+          BROWSERTEST_SELENIUM_URL: "http://localhost:4444"
+          MINK_DRIVER_ARGS_WEBDRIVER: '["chrome", {"browserName": "chrome", "platformName": "LINUX", "goog:chromeOptions": {"args": ["--disable-gpu", "--headless", "--no-sandbox", "--disable-dev-shm-usage"]}}, "http://localhost:4444"]'
         run: |
           # Start PHP's built-in web server in the background
           cd web
@@ -161,15 +193,13 @@ jobs:
           # Test connection
           curl -I http://127.0.0.1:8080 || echo "Web server not responding"
           
-          # Run tests
-          echo "Running tests:"
-          SIMPLETEST_BASE_URL=http://127.0.0.1:8080 ../vendor/bin/phpunit --verbose --configuration ../phpunit.xml
+          # Return to root directory before running tests
+          cd ..
           
-          # Kill the PHP server
-          kill $SERVER_PID || true
-        env:
-          WEBDRIVER_HOST: "selenium"
-          SIMPLETEST_BASE_URL: "http://127.0.0.1:8080"
+          # Run tests
+          export BROWSERTEST_OUTPUT_DIRECTORY="$(pwd)/web/sites/simpletest/browser_output"
+          chmod +x ./vendor/bin/phpunit
+          ./vendor/bin/phpunit -c $(pwd)/phpunit.xml --verbose --debug --log-junit test-results.xml
 ```
 
 ### PHPUnit Configuration File (phpunit.xml)
@@ -189,24 +219,27 @@ jobs:
     <ini name="error_reporting" value="32767"/>
     <ini name="memory_limit" value="-1"/>
     <env name="SIMPLETEST_BASE_URL" value="http://127.0.0.1:8080"/>
-    <env name="SIMPLETEST_DB" value="mysql://root:root@mysql:3306/MODULE_NAME_testing"/>
-    <env name="BROWSERTEST_OUTPUT_DIRECTORY" value="/tmp/browser_output"/>
+    <env name="SIMPLETEST_DB" value="mysql://root:root@127.0.0.1/drupal_testing"/>
+    <env name="BROWSERTEST_OUTPUT_DIRECTORY" value="web/sites/simpletest/browser_output"/>
+    <env name="BROWSERTEST_SELENIUM_URL" value="http://localhost:4444"/>
+
+    // minK CLASS??
     <env name="SYMFONY_DEPRECATIONS_HELPER" value="weak"/>
     <env name="PHPUNIT_ASSERTIONS_DISABLE" value="assertionError"/>
     <env name="XDEBUG_MODE" value="off"/>
   </php>
   <testsuites>
     <testsuite name="unit">
-      <directory>web/modules/custom/MODULE_NAME/tests/src/Unit</directory>
+      <directory>web/modules/custom/draggable_mapper/tests/src/Unit</directory>
     </testsuite>
     <testsuite name="kernel">
-      <directory>web/modules/custom/MODULE_NAME/tests/src/Kernel</directory>
+      <directory>web/modules/custom/draggable_mapper/tests/src/Kernel</directory>
     </testsuite>
     <testsuite name="functional">
-      <directory>web/modules/custom/MODULE_NAME/tests/src/Functional</directory>
+      <directory>web/modules/custom/draggable_mapper/tests/src/Functional</directory>
     </testsuite>
     <testsuite name="functional-javascript">
-      <directory>web/modules/custom/MODULE_NAME/tests/src/FunctionalJavascript</directory>
+      <directory>web/modules/custom/draggable_mapper/tests/src/FunctionalJavascript</directory>
     </testsuite>
   </testsuites>
   <listeners>
@@ -322,6 +355,8 @@ jobs:
    - Always run Docker Desktop as Administrator
    - Run PowerShell as Administrator when executing act commands
    - Use the correct Docker socket path: `npipe:////./pipe/docker_engine`
+
+5.
 
 ## Further Resources
 
